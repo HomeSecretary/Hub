@@ -1,0 +1,62 @@
+# 허브 저장소의 compose 파일. Jenkins가 배포할 때 쓰고, 직접 손으로 올릴 때도 같은 파일을 쓴다.
+#
+# 설정값은 --env-file 로 넘긴 .env 에서 읽는다 (Jenkins는 Credentials의 Secret file을 넘긴다).
+# Jenkins 배포 시 셸 환경으로 넘어오는 값:
+#   IMAGE_TAG                Git 커밋 해시 앞 12자리
+#   SECRETARY_DATA_DIR_HOST  NAS의 데이터 폴더 절대 경로 (예: /volume1/docker/secretary/data)
+#
+# 네트워크는 세 개로 나눈다. 허브와 모듈이 저장소(= compose 프로젝트)가 달라서
+# 네트워크는 deploy.sh가 미리 만들어 두고(ensure_networks) 여기서는 external로 가져다 쓴다.
+#   secretary_edge     cloudflared ↔ 허브. 바깥에서 들어오는 길은 이것 하나
+#   secretary_modules  허브 ↔ 모듈. internal 이라서 이 네트워크로는 인터넷에 나갈 수 없다
+#   secretary_egress   인터넷이 필요한 모듈만 붙인다 (메일 모듈 → AWS SES). 허브는 붙지 않는다
+# 모듈은 edge에 없으므로 cloudflared(= 바깥)에서 모듈로 바로 갈 길이 없다.
+#
+# 모듈은 각자 저장소에서 배포한다. 허브 쪽에서는 .env의 SECRETARY_MODULES / SECRETARY_MODULE_TOKENS 에
+# 한 줄씩 넣기만 한다. 허브 코드는 고치지 않는다 (docs/module-contract.md).
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?TUNNEL_TOKEN is required}
+    networks: [edge]
+
+  # 허브: 인증, 사용자, 권한, 승인, 감사 로그, 명령 전달
+  secretary:
+    image: secretary:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      target: runtime
+    container_name: secretary
+    restart: unless-stopped
+    # env_file로 .env 전체를 넘기지 않는다. 필요한 값만 골라 넘긴다.
+    environment:
+      - SECRETARY_DATA_DIR=/data
+      - SECRETARY_MAX_USERS=${SECRETARY_MAX_USERS:-4}
+      - SECRETARY_REQUIRE_CF_ACCESS=${SECRETARY_REQUIRE_CF_ACCESS:-true}
+      - SECRETARY_CLOCK_SKEW_SECONDS=${SECRETARY_CLOCK_SKEW_SECONDS:-60}
+      - SECRETARY_APPROVAL_TTL_SECONDS=${SECRETARY_APPROVAL_TTL_SECONDS:-300}
+      - SECRETARY_MODULES=${SECRETARY_MODULES:-}
+      - SECRETARY_MODULE_TOKENS=${SECRETARY_MODULE_TOKENS:-}
+    volumes:
+      - ${SECRETARY_DATA_DIR_HOST:-./data}:/data
+    # 바깥으로 여는 포트는 없다. cloudflared만 같은 네트워크 안에서 secretary:8080 으로 닿는다.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [edge, modules]
+
+networks:
+  edge:
+    name: secretary_edge
+    external: true
+  modules:
+    name: secretary_modules
+    external: true
